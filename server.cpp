@@ -72,6 +72,9 @@ bool is_final_data_packet(int data_length)
         return false; // Not final packet
     }
 }
+
+
+
 //define ACK packet structure
 struct __attribute__((__packed__)) tftp_ack_packet
 {
@@ -197,4 +200,10 @@ int write_octets_file(FILE *fp, const char* buffer, int data_length)
         return -1;
     }
     return bytes_written;
+}
+int main(int argc, char *argv[])
+{
+    // This is a placeholder for the main function.
+    // You can implement the server logic here.
+    return 0;
 }

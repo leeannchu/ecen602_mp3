@@ -3,7 +3,7 @@ client
 server
 *.out
 *.exe
-
+*.dSYM
 # Python
 *.py
 #json
