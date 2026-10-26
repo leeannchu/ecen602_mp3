@@ -10,7 +10,9 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <sys/wait.h>
-
+#include <strings.h>   
+#include <fcntl.h>
+#include <sys/select.h>
 //define TFTP packets with their opcodes
 #define TFTP_RRQ 1
 #define TFTP_WRQ 2
@@ -19,7 +21,8 @@
 #define TFTP_ERROR 5
 #define MAX_DATA_SIZE 512
 #define MAX_PKT (4 + MAX_DATA_SIZE)   // 516: largest legal TFTP packet
-
+#define TIMEOUT_SEC  1    // wait this long for an ACK before retransmitting
+#define MAX_TIMEOUTS 10   // give up after this many timeouts in a row
 
 //define RRQ and WRQ(bonus) packet structure
 char rrq_buffer[516]; // buffer to hold the RRQ packet
@@ -208,6 +211,10 @@ int write_octets_file(FILE *fp, const char* buffer, int data_length)
     }
     return bytes_written;
 }
+
+//====================================
+// handle connection and flow control
+//====================================
 // Check that an RRQ/WRQ really holds "filename\0mode\0" inside its length,
 // so decode_rrq_packet()/decode_wrq_packet() (which use strcpy) are safe.
 bool is_valid_request(const char *buf, int len)
@@ -237,6 +244,141 @@ void sigchld_handler(int signo){
         ;
     errno = saved_errno;
 }
+//handle file open and return the pointer.
+FILE *open_request_file(const char *filename, uint16_t opcode,
+                        uint16_t *err_code, const char **err_msg)
+{
+    FILE *fp;
+    if (opcode == TFTP_RRQ) {
+        fp = fopen(filename, "rb");
+    } else {
+        // O_EXCL: fail if the file already exists, so a WRQ never overwrites anything
+        int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        fp = (fd < 0) ? NULL : fdopen(fd, "wb");
+        if (fd >= 0 && fp == NULL) close(fd);
+    }
+    if (fp != NULL) return fp;
+
+    int e = errno;                    // save it before anything else can change it
+    switch (e) {
+    case ENOENT: *err_code = 1; *err_msg = "File not found";                   break;
+    case EACCES: *err_code = 2; *err_msg = "Access violation";                 break;
+    case ENOSPC: *err_code = 3; *err_msg = "Disk full or allocation exceeded"; break;
+    case EEXIST: *err_code = 6; *err_msg = "File already exists";              break;
+    default:     *err_code = 0; *err_msg = strerror(e);                        break;
+    }
+    return NULL;
+}
+// Wait up to sec for sock to have data.
+// Returns >0 if readable, 0 on timeout, <0 on error.
+int wait_readable(int sock, int sec){
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(sock, &rset);
+    struct timeval tv;
+    tv.tv_sec  = sec;
+    tv.tv_usec = 0;
+    return select(sock + 1, &rset, NULL, NULL, &tv);
+}
+// True if a and b have the same IP address and port (same TID).
+bool same_peer(const struct sockaddr_in *a, const struct sockaddr_in *b){
+    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+}
+
+// send the whole file with stop-and-wait.
+// Returns true if every block (including the last) is acknowledged,
+// false if the transfer fails for whatever reason.
+bool send_file(int sock, const struct sockaddr_in *client, FILE *fp, bool is_netascii)
+{
+    char data[MAX_DATA_SIZE];   // the next block of file data
+    char pkt[MAX_PKT];          // the DATA packet currently in flight (kept for retransmission)
+    char rbuf[MAX_PKT + 1];     // incoming packets; +1 to detect oversized ones
+    uint16_t block = 1;         // 16-bit: 65535 + 1 wraps to 0 automatically
+    unsigned long total = 0;    // blocks sent, for the log
+    for (;;) {
+        int n = 0;      // number of data bytes in this block (0..512)
+        int len = 0;    // length of the whole DATA packet (n + 4)
+        n = is_netascii ? read_netascii_file(fp, data) : read_octets_file(fp, data);
+        if (n < 0) {
+            send_error(sock, client, 0, "Read error");
+            return false;
+        }
+        encode_data_packet(pkt, block, data, n, &len);
+        //send the packet 
+        if (sendto(sock, pkt, len, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+            perror("sendto");
+            return false;
+        }
+        //Wait for ACK(block), retransmit only on timeout, otherwise receive from socket
+        int timeouts = 0;   // consecutive timeouts for current block
+        for (;;) {
+            int r = wait_readable(sock, TIMEOUT_SEC);
+            //error handle for timeout
+            if(r < 0){
+                if(errno == EINTR) continue;
+                perror("wait_readable");
+                return false;
+            //timeout, resend the packet, if timeout too many times, give up and return fail
+            }else if(r == 0){
+                timeouts++;
+                if(timeouts >= MAX_TIMEOUTS){
+                    printf("Timeout waiting for ACK %u from client\n", block);
+                    return false;
+                }
+                // resend the same packet
+                if (sendto(sock, pkt, len, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+                    perror("sendto");
+                    return false;
+                }
+                continue;
+            }
+            //otherwise, a packst is waiting, receive and decode it.
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            //receive packet in rbuf.
+            ssize_t ack_len = recvfrom(sock, rbuf, sizeof(rbuf), 0, (struct sockaddr *)&from, &fromlen);
+            //error when receive 
+            if(ack_len < 0){
+                if(errno == EINTR) continue;
+                perror("recvfrom");
+                return false;
+            // too short, too long,ignore
+            }else if (ack_len < 4 || ack_len == (ssize_t)sizeof(rbuf)) {
+                continue;
+            // unknown transfer ID, send error 5 to the sender and continue
+            }else if (same_peer(&from, client) == false) {
+                send_error(sock, &from, 5, "Unknown transfer ID");
+                continue;
+            }
+            //decode it as an ACK, then
+            uint16_t network_opcode, network_block; 
+            decode_ack_packet(rbuf, (int)ack_len, &network_opcode, &network_block);
+            if(network_opcode == TFTP_ERROR){
+                printf("Received ERROR packet from client, aborting transfer\n");
+                return false;
+            }else if (network_opcode != TFTP_ACK){
+                send_error(sock, &from, 4, "Illegal TFTP operation");
+                return false;
+            }else if (network_block == block){
+                //this is the ACK we were waiting for, break out of this loop and move on to the next block
+                break;
+            }else{
+                //whatever else is not legit, ignore it and do not resend the packet
+                continue;
+            }  
+        }
+        total++;
+        // end condition(last block) check
+        if(is_final_data_packet(n)){
+            printf("File transfer complete, total blocks sent: %lu\n", total);
+            return true;
+        }else{
+            block++;
+        }
+    }
+}
+
+
 int main(int argc, char *argv[]){
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
@@ -255,7 +397,7 @@ int main(int argc, char *argv[]){
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;             // restart recvfrom() automatically after the signal
+    sa.sa_flags = SA_RESTART;            
     if (sigaction(SIGCHLD, &sa, NULL) < 0) {
         perror("sigaction");
         exit(1);
@@ -286,7 +428,7 @@ int main(int argc, char *argv[]){
                              (struct sockaddr *)&cliaddr, &clilen);
         //sanity check for receive frame size, refuse obviously invalid packets.
         if (n < 0) {
-            // interrupted by a signal (matters from Step 2)
+            // interrupted by a signal 
             if (errno == EINTR) continue;     
             perror("recvfrom");
             continue;
@@ -344,9 +486,8 @@ int main(int argc, char *argv[]){
             continue;
 
         // child process starts here.
-
         close(listenfd);  // good habit to close this :)   
-        // open send sokect             
+        // open send socket             
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) {
             perror("socket");
@@ -367,10 +508,46 @@ int main(int argc, char *argv[]){
         printf("[child %d] serving %s:%d on port %d\n",
                getpid(), ip, ntohs(cliaddr.sin_port), ntohs(myaddr.sin_port));
 
-        // 
-        // Temporary: tell the client we are not done yet, so it stops waiting.
-        send_error(sock, &cliaddr, 0, "Not implemented yet");
-
+        //first check mode validility 
+        bool valid_mode = (strcasecmp(mode, "netascii") == 0 || strcasecmp(mode, "octet") == 0);
+        if (!valid_mode) {
+            printf("invalid mode \"%s\" from %s:%d -> ERROR 4\n", mode, ip, ntohs(cliaddr.sin_port));
+            send_error(sock, &cliaddr, 4, "Illegal TFTP operation");
+            close(sock);
+            exit(1);
+        }
+        //security check: block access to files outside the current directory
+        bool valid_file = (strchr(filename, '/') == NULL && strchr(filename, '\\') == NULL&& strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0);
+        if (!valid_file) {
+            printf("invalid filename \"%s\" from %s:%d -> ERROR 2\n", filename, ip, ntohs(cliaddr.sin_port));
+            send_error(sock, &cliaddr, 2, "Access violation");
+            close(sock);
+            exit(1);
+        }
+        //open file 
+        //this is a handler that help decide the transfer mode.
+        bool is_netascii = (strcasecmp(mode, "netascii") == 0);
+        uint16_t err_code;
+        const char *err_msg;
+        FILE *fp = open_request_file(filename, opcode, &err_code, &err_msg);
+        if (fp == NULL) {
+            printf("[child %d] cannot open \"%s\" -> ERROR %u (%s)\n",
+                   getpid(), filename, err_code, err_msg);
+            send_error(sock, &cliaddr, err_code, err_msg);
+            close(sock);
+            exit(0);
+        }
+        printf("[child %d] opened \"%s\" for %s (%s)\n", getpid(), filename,
+               opcode == TFTP_RRQ ? "reading" : "writing", is_netascii ? "netascii" : "octet");
+        //send mode
+        if (opcode == TFTP_RRQ) {
+            bool ok = send_file(sock, &cliaddr, fp, is_netascii);
+            printf("[child %d] %s \"%s\"\n", getpid(), ok ? "finished sending" : "aborted", filename);
+        } else {
+        //bonus: write mode (TODO)
+        }
+        
+        fclose(fp);
         close(sock);
         exit(0);
     }
