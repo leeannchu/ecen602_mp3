@@ -5,6 +5,11 @@
 #include "stdlib.h"
 #include "arpa/inet.h"
 #include "netinet/in.h"
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 //define TFTP packets with their opcodes
 #define TFTP_RRQ 1
@@ -13,6 +18,8 @@
 #define TFTP_ACK 4
 #define TFTP_ERROR 5
 #define MAX_DATA_SIZE 512
+#define MAX_PKT (4 + MAX_DATA_SIZE)   // 516: largest legal TFTP packet
+
 
 //define RRQ and WRQ(bonus) packet structure
 char rrq_buffer[516]; // buffer to hold the RRQ packet
@@ -201,9 +208,171 @@ int write_octets_file(FILE *fp, const char* buffer, int data_length)
     }
     return bytes_written;
 }
-int main(int argc, char *argv[])
+// Check that an RRQ/WRQ really holds "filename\0mode\0" inside its length,
+// so decode_rrq_packet()/decode_wrq_packet() (which use strcpy) are safe.
+bool is_valid_request(const char *buf, int len)
 {
-    // This is a placeholder for the main function.
-    // You can implement the server logic here.
-    return 0;
+    if (len < 4) return false;
+    const char *p   = buf + 2;
+    const char *end = buf + len;
+    const char *z1  = (const char *)memchr(p, '\0', end - p);            // end of filename
+    if (z1 == NULL || z1 == p) return false;                             // missing or empty
+    const char *z2  = (const char *)memchr(z1 + 1, '\0', end - (z1 + 1)); // end of mode
+    return z2 != NULL && z2 != z1 + 1;                                   // mode present and non-empty
+}
+ 
+// Build and send an ERROR packet 
+void send_error(int sock, const struct sockaddr_in *to, uint16_t code, const char *msg)
+{
+    char pkt[MAX_PKT];
+    int len;
+    encode_error_packet(pkt, code, msg, &len);
+    sendto(sock, pkt, len, 0, (const struct sockaddr *)to, sizeof(*to));
+}
+// Reap every finished child so none become zombies.
+void sigchld_handler(int signo){
+    (void)signo;
+    int saved_errno = errno;              // waitpid may change errno; restore it
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
+    errno = saved_errno;
+}
+int main(int argc, char *argv[]){
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        exit(1);
+    }
+    char *end;
+    //check port valid or not 
+    long port = strtol(argv[1], &end, 10);
+    if (*end != '\0' || port < 1 || port > 65535) {
+        fprintf(stderr, "Invalid port: %s\n", argv[1]);
+        exit(1);
+    }
+    // print each line immediately; no duplicates after fork()
+    setvbuf(stdout, NULL, _IOLBF, 0);     
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;             // restart recvfrom() automatically after the signal
+    if (sigaction(SIGCHLD, &sa, NULL) < 0) {
+        perror("sigaction");
+        exit(1);
+    }
+    //open a listen socket 
+    int listenfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (listenfd < 0) {
+        perror("socket");
+        exit(1);
+    }
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family      = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port        = htons((uint16_t)port);
+    //bind socket to the port 
+    if (bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind");
+        exit(1);
+    }
+    printf("TFTP server listening on UDP port %ld\n", port); 
+    char buf[MAX_PKT + 1];            
+    //infinitely receive request from any client, if valid request, fork a child to handle the request, parent will go back to listen for next request
+    for (;;) {
+        struct sockaddr_in cliaddr;
+        socklen_t clilen = sizeof(cliaddr);
+        ssize_t n = recvfrom(listenfd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&cliaddr, &clilen);
+        //sanity check for receive frame size, refuse obviously invalid packets.
+        if (n < 0) {
+            // interrupted by a signal (matters from Step 2)
+            if (errno == EINTR) continue;     
+            perror("recvfrom");
+            continue;
+        }
+        if (n == (ssize_t)sizeof(buf)) {      
+            // larger than any legal TFTP packet
+            fprintf(stderr, "Oversized datagram ignored\n");
+            continue;
+        }
+        if (n < 2) {                          
+            // not an opcode
+            fprintf(stderr, "Runt datagram ignored\n");
+            continue;
+        }
+        //terminator for strcpy
+        buf[n] = '\0';                       
+        
+        // connection handle for client.
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &cliaddr.sin_addr, ip, sizeof(ip));
+        // decode the opcode from the request packet, check validity
+        uint16_t opcode;
+        memcpy(&opcode, buf, 2);
+        opcode = ntohs(opcode);
+        // Only RRQ/WRQ may start a transfer.
+        if (opcode != TFTP_RRQ && opcode != TFTP_WRQ) {
+            printf("opcode %u from %s:%d is not a request -> ERROR 4\n",
+                   opcode, ip, ntohs(cliaddr.sin_port));
+            send_error(listenfd, &cliaddr, 4, "Illegal TFTP operation");
+            continue;
+        }
+        if (!is_valid_request(buf, (int)n)) {
+            printf("malformed request from %s:%d -> ERROR 4\n", ip, ntohs(cliaddr.sin_port));
+            send_error(listenfd, &cliaddr, 4, "Malformed request");
+            continue;
+        }
+        //filename handle
+        char filename[MAX_PKT], mode[MAX_PKT];
+        if (opcode == TFTP_RRQ)
+            decode_rrq_packet(buf, (int)n, &opcode, filename, mode);
+        else
+            decode_wrq_packet(buf, (int)n, &opcode, filename, mode);
+ 
+        printf("%s from %s:%d  filename=\"%s\"  mode=\"%s\"\n",
+               opcode == TFTP_RRQ ? "RRQ" : "WRQ", ip, ntohs(cliaddr.sin_port), filename, mode);
+        //fork a child and handle the transfer request.
+        pid_t pid = fork();
+        //fork failed for whatever reason, parent go back and wait for the next transfer request.
+        if (pid < 0) {
+            perror("fork");
+            continue;
+        }
+        // child forked. Parent go back and wait for the next request
+        if (pid > 0)                 
+            continue;
+
+        // child process starts here.
+
+        close(listenfd);  // good habit to close this :)   
+        // open send sokect             
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            perror("socket");
+            exit(1);
+        }
+        struct sockaddr_in myaddr;
+        memset(&myaddr, 0, sizeof(myaddr));
+        myaddr.sin_family      = AF_INET;
+        myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        // use whatever available port
+        myaddr.sin_port        = htons(0);            
+        if (bind(sock, (struct sockaddr *)&myaddr, sizeof(myaddr)) < 0) {
+            perror("bind");
+            exit(1);
+        }
+        socklen_t mylen = sizeof(myaddr);
+        getsockname(sock, (struct sockaddr *)&myaddr, &mylen);   // which port did we get?
+        printf("[child %d] serving %s:%d on port %d\n",
+               getpid(), ip, ntohs(cliaddr.sin_port), ntohs(myaddr.sin_port));
+
+        // 
+        // Temporary: tell the client we are not done yet, so it stops waiting.
+        send_error(sock, &cliaddr, 0, "Not implemented yet");
+
+        close(sock);
+        exit(0);
+    }
+    
 }
