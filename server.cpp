@@ -378,6 +378,110 @@ bool send_file(int sock, const struct sockaddr_in *client, FILE *fp, bool is_net
     }
 }
 
+// write the whole file with stop-and-wait.
+// Returns true if every block (including the last) is acknowledged,
+// false if the transfer fails for whatever reason.
+bool write_file(int sock, const struct sockaddr_in *client, FILE *fp, bool is_netascii){
+    char data[MAX_DATA_SIZE];   // the next block of file data
+    char pkt[MAX_PKT];          // the DATA packet currently in flight (kept for retransmission)
+    char rbuf[MAX_PKT + 1];     // incoming packets; +1 to detect oversized ones
+    uint16_t block = 1;         // 16-bit: 65535 + 1 wraps to 0 automatically
+    unsigned long total = 0;    // blocks sent, for the log
+    for (;;) {
+        //send ACK(block-1) to client, for the first block, send ACK(0)
+        int n=0;    // number of data bytes in this block (0..512)
+        encode_ack_packet(pkt, block - 1);
+        if (sendto(sock, pkt, 4, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+            perror("sendto");
+            return false;
+        }
+        //Wait for DATA(block), retransmit only on timeout, otherwise receive from socket
+        int timeouts = 0;   // consecutive timeouts for current block
+        for (;;) {
+            int r = wait_readable(sock, TIMEOUT_SEC);
+            //error handle for timeout
+            if(r < 0){
+                if(errno == EINTR) continue;
+                perror("wait_readable");
+                return false;
+            //timeout, resend the packet, if timeout too many times, give up and return fail
+            }else if(r == 0){
+                timeouts++;
+                if(timeouts >= MAX_TIMEOUTS){
+                    printf("Timeout waiting for DATA %u from client\n", block);
+                    return false;
+                }
+                // resend the same ACK packet
+                if (sendto(sock, pkt, 4, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+                    perror("sendto");
+                    return false;
+                }
+                continue;
+            }
+            //otherwise, a packst is waiting, receive and decode it.
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            //receive packet in rbuf.
+            ssize_t data_len = recvfrom(sock, rbuf, sizeof(rbuf), 0, (struct sockaddr *)&from, &fromlen);
+            //error when receive 
+            if(data_len < 0){
+                if(errno == EINTR) continue;
+                perror("recvfrom");
+                return false;
+            // too short, too long,ignore
+            }else if (data_len < 4 || data_len == (ssize_t)sizeof(rbuf)) {
+                continue;
+            // unknown transfer ID, send error 5 to the sender and continue
+            }else if (same_peer(&from, client) == false) {
+                send_error(sock, &from, 5, "Unknown transfer ID");
+                continue;
+            }
+            //decode it as an DATA packet
+            uint16_t network_opcode, network_block; 
+            int data_length;
+            decode_data_packet(rbuf, (int)data_len, &network_opcode, &network_block, data, &data_length);
+            if(network_opcode == TFTP_ERROR){
+                printf("Received ERROR packet from client, aborting transfer\n");
+                return false;
+            }else if (network_opcode != TFTP_DATA){
+                send_error(sock, &from, 4, "Illegal TFTP operation");
+                return false;
+            }else if (network_block == block){
+                //this is the DATA we were waiting for, write it to file
+                n = is_netascii ? write_netascii_file(fp, data, data_length) : write_octets_file(fp, data, data_length);
+                if (n < 0) {
+                    send_error(sock, client, 0, "Write error");
+                    return false;   
+                }
+                break; // break out of this loop and move on to the next block
+            //ack lost, send the previous ACK again, but do NOT write the data again
+            }else if (network_block == (uint16_t)(block - 1)){
+                // duplicate of the previous block: our ACK was lost, resend it (do NOT write again)
+                if (sendto(sock, pkt, 4, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+                    perror("sendto");
+                    return false;
+                }
+                continue;
+            }else{
+                //whatever else is not legit, ignore it and do not resend the packet
+                continue;
+                }
+            }
+        total++; 
+        // end condition(last block) check
+        if(is_final_data_packet(n)){
+            encode_ack_packet(pkt, block);
+            if (sendto(sock, pkt, 4, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
+                perror("sendto");
+            }
+            printf("File transfer complete, total blocks written: %lu\n", total);
+            return true;
+        }else{
+            block++;
+        }
+    }
+}
+
 
 int main(int argc, char *argv[]){
     if (argc != 2) {
@@ -544,6 +648,16 @@ int main(int argc, char *argv[]){
             bool ok = send_file(sock, &cliaddr, fp, is_netascii);
             printf("[child %d] %s \"%s\"\n", getpid(), ok ? "finished sending" : "aborted", filename);
         } else {
+            bool ok = write_file(sock, &cliaddr, fp, is_netascii);
+            printf("[child %d] %s \"%s\"\n", getpid(), ok ? "finished sending" : "aborted", filename);
+            if(!ok){
+                //if write failed, delete the file
+                fclose(fp);
+                unlink(filename);
+                remove(filename);
+                close(sock);
+                exit(1);
+            }
         //bonus: write mode (TODO)
         }
         
