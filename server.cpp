@@ -325,6 +325,7 @@ bool send_file(int sock, const struct sockaddr_in *client, FILE *fp, bool is_net
                     printf("[child %d]Timeout waiting for ACK %u from client\n", getpid(), block);
                     return false;
                 }
+                printf("[child %d] timeout %d/%d waiting for ACK %u, retransmitting DATA %u\n",getpid(), timeouts, MAX_TIMEOUTS, block, block);
                 // resend the same packet
                 if (sendto(sock, pkt, len, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
                     perror("sendto");
@@ -411,6 +412,7 @@ bool write_file(int sock, const struct sockaddr_in *client, FILE *fp, bool is_ne
                     printf("[child %d]Timeout waiting for DATA %u from client\n", getpid(), block);
                     return false;
                 }
+                printf("[child %d] timeout %d/%d waiting for DATA %u, resending ACK %u\n",getpid(), timeouts, MAX_TIMEOUTS, block, (uint16_t)(block - 1));
                 // resend the same ACK packet
                 if (sendto(sock, pkt, 4, 0, (const struct sockaddr *)client, sizeof(*client)) < 0) {
                     perror("sendto");
